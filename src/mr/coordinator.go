@@ -46,6 +46,8 @@ type (
 		CompleteTask         []Task
 		// 使用 reduce worker数量
 		NReduce int
+		// 结束标识
+		done bool
 	}
 	Task struct {
 		// 共同字段
@@ -171,7 +173,7 @@ func (c *Coordinator) ReportTaskState(args *ReportTaskStateArgs, reply *ReportTa
 		log.Println(c.CompleteTask)
 		log.Println(c.ErrorTask)
 		log.Println(c.CompletedOutputFiles)
-		c.Done()
+		c.done = true
 	}
 	reply.Status = http.StatusOK
 	return nil
@@ -220,8 +222,7 @@ func (c *Coordinator) server() {
 // main/mrcoordinator.go calls Done() periodically to find out
 // if the entire job has finished.
 func (c *Coordinator) Done() bool {
-	os.Exit(1)
-	return true
+	return c.done
 }
 
 // create a Coordinator.
