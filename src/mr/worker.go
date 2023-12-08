@@ -2,6 +2,7 @@ package mr
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"log"
@@ -45,7 +46,6 @@ func Worker(mapf func(string, string) []KeyValue,
 	maxConcurrency := 10                             // 定义任务最大任务数
 	maxConcurrencyChannel := make(chan struct{}, 10) // 定义任务最大任务数
 	taskQueue := make(chan Task, 10)                 // 存储任务
-	defer close(taskQueue)
 	// 连接协调者
 	client, err := rpc.DialHTTP("tcp", "127.0.0.1:1234")
 	if err != nil {
@@ -61,9 +61,13 @@ func Worker(mapf func(string, string) []KeyValue,
 				log.Println("ask task...")
 				if err = client.Call("Coordinator.AskTask", &args, &reply); err != nil {
 					log.Println("ask task error:", err)
+					if errors.Is(err, rpc.ErrShutdown) {
+						close(taskQueue)
+						break
+					}
 				}
 				if reply.Task.Type != "" {
-					log.Println("ask task ", reply.Task)
+					log.Println("receive task ", reply.Task)
 					taskQueue <- reply.Task
 					reportIdle(client, workerId, reply.Task.Type, reply.Task.Id)
 				}
@@ -102,7 +106,7 @@ func Worker(mapf func(string, string) []KeyValue,
 						log.Println("don't json marshal keyValues:", task.Split, err)
 						return
 					}
-					if err = os.WriteFile(task.IntermediateFile, marshal, 755); err != nil {
+					if err = os.WriteFile(task.IntermediateFile, marshal, os.ModePerm); err != nil {
 						log.Println("don't write intermediate file:", task.Split, task.IntermediateFile, err)
 						return
 					}
@@ -113,6 +117,13 @@ func Worker(mapf func(string, string) []KeyValue,
 				finalSum := 0
 				intermediateFileChannel := make(chan string, 10)
 				go func() {
+					//defer func() {
+					//	if err != nil {
+					//		reportError(client, workerId, task.Type, task.Id, err) // 报告任务出现错误
+					//	} else {
+					//		reportCompleted(client, workerId, task.Type, task.Id) // 报告任务已完成
+					//	}
+					//}()
 					for {
 						args := GetIntermediateFilesArgs{
 							WorkerId:     workerId,
@@ -131,27 +142,30 @@ func Worker(mapf func(string, string) []KeyValue,
 						if receiveCount >= reply.Sum {
 							finalSum = reply.Sum
 							close(intermediateFileChannel)
+							log.Println("all intermediate file has received", finalSum)
 							break
 						}
 						time.Sleep(time.Second)
 					}
 				}()
 				// 获取NReduce（为了计算相同key的桶位）
-				args2 := GetNReduceArgs{
-					WorkerId:     workerId,
-					ReduceTaskId: task.Id,
+				args2 := GetNTaskArgs{
+					WorkerId: workerId,
 				}
-				reply2 := GetNReduceReply{}
-				if err = client.Call("Coordinator.GetNReduce", &args2, &reply2); err != nil {
+				reply2 := GetNTaskReply{}
+				if err = client.Call("Coordinator.GetNTask", &args2, &reply2); err != nil {
 					log.Println("client call Coordinator.GetNReduce failed:", err)
 					return
 				}
 				nReduce := reply2.NReduce
+				nMap := reply2.NMap
 				// 处理中间文件
 				maxReduceConcurrency := 5
 				maxReduceConcurrencyChannel := make(chan struct{}, maxReduceConcurrency)
 
-				smap := sync.Map{}
+				mmapMutex := sync.Mutex{}
+				mmap := make(map[string][]string)
+				//smap := sync.Map{}
 				tampOfile, err := os.Create(task.OutputFile + ".tamp")
 				if err != nil {
 					log.Println("os create tamp output file failed:", err)
@@ -164,6 +178,13 @@ func Worker(mapf func(string, string) []KeyValue,
 						defer func() {
 							<-maxReduceConcurrencyChannel
 						}()
+						//defer func() {
+						//	if err != nil {
+						//		reportError(client, workerId, task.Type, task.Id, err) // 报告任务出现错误
+						//	} else {
+						//		reportCompleted(client, workerId, task.Type, task.Id) // 报告任务已完成
+						//	}
+						//}()
 						defer handleIntermediateNumber.Add(1)
 						// 读取中间文件
 						bytes, err := os.ReadFile(intermediateFile)
@@ -181,7 +202,7 @@ func Worker(mapf func(string, string) []KeyValue,
 						right := 0
 						for i := 0; i < len(keyValues); i++ {
 							if i+1 == len(keyValues) || keyValues[i+1].Key != keyValues[left].Key {
-								if h := ihash(keyValues[left].Key) % nReduce; h != task.Id {
+								if h := (ihash(keyValues[left].Key) % nReduce) + nMap; h != task.Id {
 									left = i + 1
 									right = i + 1
 									continue
@@ -191,13 +212,14 @@ func Worker(mapf func(string, string) []KeyValue,
 								for j := left; j <= right; j++ {
 									values = append(values, keyValues[j].Value)
 								}
-								if v, ok := smap.Load(keyValues[left].Key); !ok {
-									smap.Store(keyValues[left].Key, values)
+								mmapMutex.Lock()
+								if vs, ok := mmap[keyValues[left].Key]; !ok {
+									mmap[keyValues[left].Key] = values
 								} else {
-									vs := v.([]string)
 									vs = append(vs, values...)
-									smap.Store(keyValues[left].Key, vs)
+									mmap[keyValues[left].Key] = append(mmap[keyValues[left].Key], values...)
 								}
+								mmapMutex.Unlock()
 								left = i + 1
 								right = i + 1
 							}
@@ -209,10 +231,9 @@ func Worker(mapf func(string, string) []KeyValue,
 				}
 				// 将output内容写入output文件文件中
 				results := make([]KeyValue, 0)
-				smap.Range(func(key, value any) bool {
-					results = append(results, KeyValue{key.(string), reducef(key.(string), value.([]string))})
-					return true
-				})
+				for k, vs := range mmap {
+					results = append(results, KeyValue{k, reducef(k, vs)})
+				}
 				sort.Sort(ByKey(results))
 				for _, r := range results {
 					if _, err = fmt.Fprintf(tampOfile, "%v %v\n", r.Key, r.Value); err != nil {
@@ -275,6 +296,7 @@ func reportError(client *rpc.Client, workerId string, taskType string, taskId in
 		Type:     taskType,
 		Id:       taskId,
 		Err:      err,
+		State:    ERROR,
 	}
 	reply := ReportTaskStateReply{}
 	if err = client.Call("Coordinator.ReportTaskState", &args, &reply); err != nil {

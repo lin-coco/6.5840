@@ -79,15 +79,14 @@ type CountIntermediateFilesReply struct {
 	intermediateFileNum int
 }
 
-type GetNReduceArgs struct {
+type GetNTaskArgs struct {
 	// 工作者id
 	WorkerId string
-	// reduce任务id
-	ReduceTaskId int
 }
-type GetNReduceReply struct {
+type GetNTaskReply struct {
 	Common
 	NReduce int
+	NMap    int
 }
 
 // Cook up a unique-ish UNIX-domain socket name

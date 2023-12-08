@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/rpc"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"sync"
@@ -44,8 +45,10 @@ type (
 		CompletedOutputFiles []string
 		ErrorTask            []Task
 		CompleteTask         []Task
-		// 使用 reduce worker数量
+		// 记录 reduce 数量
 		NReduce int
+		// 记录 map 数量
+		NMap int
 		// 结束标识
 		done bool
 	}
@@ -71,7 +74,7 @@ var (
 	completeTaskMutex      = sync.Mutex{}
 	IntermediateDir        = "intermediate"     // 中间目录
 	IntermediatePrefix     = "mr-intermediate-" // 中间目录
-	OutputDir              = "output"           // 输出目录        // 输出目录
+	OutputDir              = ""                 // 输出目录        // 输出目录
 	OutputPrefix           = "mr-out-"          // 输出目录        // 输出目录
 	HealthCheckTimeout     = 10
 )
@@ -131,12 +134,13 @@ func (c *Coordinator) calTaskState(task Task) {
 ReportTaskState 工作者向协调者报告状态
 */
 func (c *Coordinator) ReportTaskState(args *ReportTaskStateArgs, reply *ReportTaskStateReply) error {
+	taskMutex.Lock()
+	defer taskMutex.Unlock()
 	if t, ok := c.Tasks[args.Id]; !ok {
 		return fmt.Errorf("task:%d may be wait a different worker", t.Id)
 	} else if args.WorkerId != t.WorkerId {
 		return fmt.Errorf("task:%d may be give a different worker:%s", t.Id, t.WorkerId)
 	} else {
-		taskMutex.Lock()
 		t.State = args.State
 		delete(c.Tasks, args.Id)
 		c.Tasks[args.Id] = t
@@ -156,23 +160,21 @@ func (c *Coordinator) ReportTaskState(args *ReportTaskStateArgs, reply *ReportTa
 			}
 			if t.Type == REDUCE {
 				outputFilesMutex.Lock()
-				c.CompletedOutputFiles = append(c.CompletedOutputFiles, t.IntermediateFile)
+				c.CompletedOutputFiles = append(c.CompletedOutputFiles, t.OutputFile)
 				outputFilesMutex.Unlock()
 			}
 			completeTaskMutex.Lock()
 			c.CompleteTask = append(c.CompleteTask, t)
 			completeTaskMutex.Unlock()
 		}
-
-		taskMutex.Unlock()
 	}
 	// 如果全部完成，则结束
 	if len(c.ErrorTask)+len(c.CompleteTask) == len(c.Splits)+c.NReduce {
-		_ = os.RemoveAll(IntermediateDir)
-		log.Printf("\nall task has ended\n")
-		log.Println(c.CompleteTask)
-		log.Println(c.ErrorTask)
-		log.Println(c.CompletedOutputFiles)
+		//_ = os.RemoveAll(IntermediateDir)
+		log.Printf("all task has ended\n\n")
+		log.Println("CompleteTask", c.CompleteTask)
+		log.Println("ErrorTask", c.ErrorTask)
+		log.Println("CompletedOutputFiles", c.CompletedOutputFiles)
 		c.done = true
 	}
 	reply.Status = http.StatusOK
@@ -200,8 +202,9 @@ func (c *Coordinator) GetIntermediateFiles(args *GetIntermediateFilesArgs, reply
 /*
 GetNReduce reduce工作者获取NReduce
 */
-func (c *Coordinator) GetNReduce(args *GetNReduceArgs, reply *GetNReduceReply) error {
+func (c *Coordinator) GetNTask(args *GetNTaskArgs, reply *GetNTaskReply) error {
 	reply.NReduce = c.NReduce
+	reply.NMap = c.NMap
 	return nil
 }
 
@@ -217,6 +220,7 @@ func (c *Coordinator) server() {
 		log.Fatal("listen error:", err)
 	}
 	go http.Serve(l, nil)
+	log.Println("server running in:", ":1234")
 }
 
 // main/mrcoordinator.go calls Done() periodically to find out
@@ -241,14 +245,17 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	for _, split := range c.Splits {
 		unDistributedTasks[taskIdIncr] = Task{
 			Id:               taskIdIncr,
+			Type:             MAP,
 			Split:            split,
 			IntermediateFile: filepath.Join(IntermediateDir, IntermediatePrefix+strconv.Itoa(taskIdIncr)),
 		}
 		taskIdIncr++
 	}
+	c.NMap = len(c.Splits)
 	for i := 0; i < nReduce; i++ {
 		unDistributedTasks[taskIdIncr] = Task{
 			Id:         taskIdIncr,
+			Type:       REDUCE,
 			OutputFile: filepath.Join(OutputDir, OutputPrefix+strconv.Itoa(taskIdIncr)),
 		}
 		taskIdIncr++
@@ -258,9 +265,16 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	if err := os.RemoveAll(IntermediateDir); err != nil {
 		log.Fatal("remove all IntermediateDir error:", err)
 	}
-	if err := os.MkdirAll(IntermediateDir, 755); err != nil {
+	if err := os.MkdirAll(IntermediateDir, os.ModePerm); err != nil {
 		log.Fatal("mkdir all IntermediateDir error:", err)
 	}
+	//if err := os.RemoveAll(filepath.Join(OutputDir, OutputPrefix+"*")); err != nil {
+	//	log.Fatal("remove all OutputDir error:", err)
+	//}
+	//if err := os.MkdirAll(OutputDir, os.ModePerm); err != nil {
+	//	log.Fatal("mkdir all OutputDir error:", err)
+	//}
+	_ = exec.Command("sh", "-c", "rm -f mr-out-*").Run()
 	c.server()
 	return &c
 }
