@@ -8,11 +8,17 @@ import (
 	"log"
 	"net/rpc"
 	"os"
+	"runtime"
 	"sort"
 	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
+)
+
+var (
+	network = "tcp"
+	address = "127.0.0.1:1234"
 )
 
 type (
@@ -38,217 +44,299 @@ func ihash(key string) int {
 	return int(h.Sum32() & 0x7fffffff)
 }
 
-// main/mrworker.go calls this function.
-func Worker(mapf func(string, string) []KeyValue,
-	reducef func(string, []string) string) {
-
-	workerId := strconv.Itoa(os.Getpid())            // 创建WorkerId
-	maxConcurrency := 10                             // 定义任务最大任务数
-	maxConcurrencyChannel := make(chan struct{}, 10) // 定义任务最大任务数
-	taskQueue := make(chan Task, 10)                 // 存储任务
-	// 连接协调者
-	client, err := rpc.DialHTTP("tcp", "127.0.0.1:1234")
+// 连接协调者
+func connectCoordinator() *rpc.Client {
+	client, err := rpc.DialHTTP(network, address)
 	if err != nil {
 		log.Fatal("dialing:", err)
 	}
-	defer client.Close()
-	// 如果任务数小于 MaxConcurrency 定期向协调者询问任务，最大并行10个
+	return client
+}
+
+// 生成workerId
+func generateWorkerId() string {
+	return strconv.Itoa(os.Getpid())
+}
+
+// 安全的协程
+func safeGoroutine(fn func(), errorHandler func(interface{})) {
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				fmt.Printf("Recovered from panic: %v\n", r)
+				// 处理panic
+				if errorHandler != nil {
+					errorHandler(r)
+				} else {
+					// 如果你不想让整个程序终止，可以选择不调用 runtime.Goexit()
+					runtime.Goexit()
+				}
+			}
+		}()
+		fn()
+	}()
+}
+
+var (
+	client   *rpc.Client
+	workerId string
+	maxTask  int // 工作者同时处理最多的任务数量
+
+)
+
+func Init() {
+	client = connectCoordinator()
+	workerId = generateWorkerId()
+}
+
+func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string) string) {
+	var (
+		taskQueue = make(chan Task, maxTask) // 存储任务
+	)
+	go func() {
+		// 访问当前的 goroutine 信息
 		for {
-			if len(taskQueue) < maxConcurrency {
-				args := AskTaskArgs{WorkerId: workerId}
-				reply := AskTaskReply{}
-				log.Println("ask task...")
-				if err = client.Call("Coordinator.AskTask", &args, &reply); err != nil {
-					log.Println("ask task error:", err)
-					if errors.Is(err, rpc.ErrShutdown) {
-						close(taskQueue)
-						break
+			time.Sleep(5 * time.Second)
+			var m runtime.MemStats
+			runtime.ReadMemStats(&m)
+			fmt.Printf("Num Goroutine: %d\n", runtime.NumGoroutine())
+			fmt.Printf("Num Block: %d\n", m.NumGC)
+		}
+	}()
+	Init()
+	// 询问任务 接收任务
+	safeGoroutine(func() {
+		for {
+			time.Sleep(time.Second)
+			log.Printf("ask task ...\n")
+			task, err := askTask()
+			if err != nil {
+				log.Printf("error: ask task %v\n", err)
+				if errors.Is(err, rpc.ErrShutdown) {
+					close(taskQueue)
+					break
+				}
+			}
+			if task.Type == "" {
+				continue
+			}
+			taskQueue <- task
+			log.Printf("task idle... %v\n", task)
+			reportIdle(client, workerId, task.Type, task.Id) // 报告任务等待中
+		}
+	}, nil)
+	// 处理任务
+	for task := range taskQueue {
+		log.Printf("task progress...%v\n", task)
+		reportProgress(client, workerId, task.Type, task.Id) // 报告任务进行中
+		task := task
+		switch task.Type {
+		case MAP:
+			safeGoroutine(func() {
+				var err error
+				defer func() {
+					if err != nil {
+						reportError(client, workerId, task.Type, task.Id, err) // 报告任务出现错误
+						log.Printf("task error:%v...%v\n", err, task)
+						return
 					}
-				}
-				if reply.Task.Type != "" {
-					log.Println("receive task ", reply.Task)
-					taskQueue <- reply.Task
-					reportIdle(client, workerId, reply.Task.Type, reply.Task.Id)
-				}
+					reportCompleted(client, workerId, task.Type, task.Id)
+					log.Printf("task completed...%v\n", task)
+				}()
+				err = handleMapTask(task, mapf)
+			}, func(panic interface{}) {
+				defer func() {
+					reportError(client, workerId, task.Type, task.Id, panic) // 报告任务出现错误
+					log.Printf("task panic:%v...%v\n", panic, task)
+				}()
+			})
+		case REDUCE:
+			safeGoroutine(func() {
+				var err error
+				defer func() {
+					if err != nil {
+						reportError(client, workerId, task.Type, task.Id, err) // 报告任务出现错误
+						log.Printf("task error:%v...%v\n", err, task)
+						return
+					}
+					reportCompleted(client, workerId, task.Type, task.Id)
+					log.Printf("task completed...%v\n", task)
+				}()
+				err = handleReduceTask(task, reducef)
+			}, func(panic interface{}) {
+				defer func() {
+					reportError(client, workerId, task.Type, task.Id, panic) // 报告任务出现错误
+					log.Printf("task panic:%v...%v\n", panic, task)
+				}()
+			})
+		}
+	}
+}
+
+func handleMapTask(task Task, mapf func(string, string) []KeyValue) error {
+	// 读取分区内容
+	bytes, err := os.ReadFile(task.Split)
+	if err != nil {
+		return err
+	}
+	content := string(bytes)
+	keyValues := mapf(task.Split, content)
+	marshal, err := json.Marshal(keyValues)
+	if err != nil {
+		return err
+	}
+	// 写入中间文件
+	if err = os.WriteFile(task.IntermediateFile, marshal, os.ModePerm); err != nil {
+		return err
+	}
+	return nil
+}
+func handleReduceTask(task Task, reducef func(string, []string) string) error {
+	var (
+		err                         error
+		receiveIntermediateCount    atomic.Int64
+		finalIntermediateCount      atomic.Int64
+		intermediateFiles           = make(chan string)
+		maxHandleIntermediateCount  = make(chan struct{}, 5) // 最多同时处理的中间文件数量
+		hasHandleIntermediateNumber = atomic.Int64{}         // 已经完成的中间文件数量
+		mmapMutex                   = sync.Mutex{}
+		mmap                        = make(map[string][]string)
+	)
+	// 创建临时文件
+	tmpOfile, err := os.Create(task.OutputFile + ".tmp")
+	if err != nil {
+		return err
+	}
+	// 获取reduce任务数量
+	nMap, nReduce, err := getTaskCount()
+	if err != nil {
+		return err
+	}
+	// 获取中间文件以及最终数量（可能因为map error而变小）
+	safeGoroutine(func() {
+		for {
+			files, finalCount, err := getIntermediateFiles(task, receiveIntermediateCount.Load())
+			if err != nil {
+				break
+			}
+			for _, file := range files {
+				intermediateFiles <- file
+				receiveIntermediateCount.Add(1)
+			}
+			if receiveIntermediateCount.Load() >= finalCount {
+				finalIntermediateCount.Store(finalCount)
+				close(intermediateFiles)
+				break
 			}
 			time.Sleep(time.Second)
 		}
-	}()
-	// 处理任务，控制最大任务数
-	for task := range taskQueue {
-		maxConcurrencyChannel <- struct{}{}
-		go func(task Task) {
+	}, nil)
+	// 处理中间文件
+	for intermediateFile := range intermediateFiles {
+		maxHandleIntermediateCount <- struct{}{}
+		intermediateFile := intermediateFile
+		safeGoroutine(func() {
 			defer func() {
-				<-maxConcurrencyChannel
+				<-maxHandleIntermediateCount
 			}()
-			reportProgress(client, workerId, task.Type, task.Id) // 报告任务进行中
-			var err error
-			defer func() {
-				if err != nil {
-					reportError(client, workerId, task.Type, task.Id, err) // 报告任务出现错误
-				} else {
-					reportCompleted(client, workerId, task.Type, task.Id) // 报告任务已完成
-				}
-			}()
-			switch task.Type {
-			case MAP:
-				// 读取分区
-				bytes, err := os.ReadFile(task.Split)
-				if err != nil {
-					log.Println("don't read split:", task.Split, err)
-					return
-				} else {
-					content := string(bytes)
-					keyValues := mapf(task.Split, content)
-					marshal, err := json.Marshal(keyValues)
-					if err != nil {
-						log.Println("don't json marshal keyValues:", task.Split, err)
-						return
+			defer hasHandleIntermediateNumber.Add(1)
+			// 读取中间文件
+			bytes, err := os.ReadFile(intermediateFile)
+			if err != nil {
+				return
+			}
+			var keyValues []KeyValue
+			if err = json.Unmarshal(bytes, &keyValues); err != nil {
+				return
+			}
+			sort.Sort(ByKey(keyValues))
+			left := 0
+			right := 0
+			for i := 0; i < len(keyValues); i++ {
+				if i+1 == len(keyValues) || keyValues[i+1].Key != keyValues[left].Key {
+					if h := (ihash(keyValues[left].Key) % nReduce) + nMap; h != task.Id {
+						left = i + 1
+						right = i + 1
+						continue
 					}
-					if err = os.WriteFile(task.IntermediateFile, marshal, os.ModePerm); err != nil {
-						log.Println("don't write intermediate file:", task.Split, task.IntermediateFile, err)
-						return
+					right = i
+					values := make([]string, 0, right-left+1)
+					for j := left; j <= right; j++ {
+						values = append(values, keyValues[j].Value)
 					}
-				}
-			case REDUCE:
-				// 获取完成的中间文件
-				receiveCount := 0
-				finalSum := 0
-				intermediateFileChannel := make(chan string, 10)
-				go func() {
-					//defer func() {
-					//	if err != nil {
-					//		reportError(client, workerId, task.Type, task.Id, err) // 报告任务出现错误
-					//	} else {
-					//		reportCompleted(client, workerId, task.Type, task.Id) // 报告任务已完成
-					//	}
-					//}()
-					for {
-						args := GetIntermediateFilesArgs{
-							WorkerId:     workerId,
-							ReduceTaskId: task.Id,
-							ReceiveCount: receiveCount,
-						}
-						reply := GetIntermediateFilesReply{}
-						if err = client.Call("Coordinator.GetIntermediateFiles", &args, &reply); err != nil {
-							log.Println("client call Coordinator.GetIntermediateFiles failed:", err)
-							return
-						}
-						for _, file := range reply.IntermediateFiles {
-							intermediateFileChannel <- file
-						}
-						receiveCount += len(reply.IntermediateFiles)
-						if receiveCount >= reply.Sum {
-							finalSum = reply.Sum
-							close(intermediateFileChannel)
-							log.Println("all intermediate file has received", finalSum)
-							break
-						}
-						time.Sleep(time.Second)
+					mmapMutex.Lock()
+					if vs, ok := mmap[keyValues[left].Key]; !ok {
+						mmap[keyValues[left].Key] = values
+					} else {
+						vs = append(vs, values...)
+						mmap[keyValues[left].Key] = append(mmap[keyValues[left].Key], values...)
 					}
-				}()
-				// 获取NReduce（为了计算相同key的桶位）
-				args2 := GetNTaskArgs{
-					WorkerId: workerId,
-				}
-				reply2 := GetNTaskReply{}
-				if err = client.Call("Coordinator.GetNTask", &args2, &reply2); err != nil {
-					log.Println("client call Coordinator.GetNReduce failed:", err)
-					return
-				}
-				nReduce := reply2.NReduce
-				nMap := reply2.NMap
-				// 处理中间文件
-				maxReduceConcurrency := 5
-				maxReduceConcurrencyChannel := make(chan struct{}, maxReduceConcurrency)
-
-				mmapMutex := sync.Mutex{}
-				mmap := make(map[string][]string)
-				//smap := sync.Map{}
-				tampOfile, err := os.Create(task.OutputFile + ".tamp")
-				if err != nil {
-					log.Println("os create tamp output file failed:", err)
-					return
-				}
-				handleIntermediateNumber := atomic.Int64{}
-				for intermediateFile := range intermediateFileChannel {
-					maxReduceConcurrencyChannel <- struct{}{}
-					go func(intermediateFile string) {
-						defer func() {
-							<-maxReduceConcurrencyChannel
-						}()
-						//defer func() {
-						//	if err != nil {
-						//		reportError(client, workerId, task.Type, task.Id, err) // 报告任务出现错误
-						//	} else {
-						//		reportCompleted(client, workerId, task.Type, task.Id) // 报告任务已完成
-						//	}
-						//}()
-						defer handleIntermediateNumber.Add(1)
-						// 读取中间文件
-						bytes, err := os.ReadFile(intermediateFile)
-						if err != nil {
-							log.Println("read intermediate file failed:", err)
-							return
-						}
-						var keyValues []KeyValue
-						if err = json.Unmarshal(bytes, &keyValues); err != nil {
-							log.Println("json unmarshal intermediate file content failed:", err)
-							return
-						}
-						sort.Sort(ByKey(keyValues))
-						left := 0
-						right := 0
-						for i := 0; i < len(keyValues); i++ {
-							if i+1 == len(keyValues) || keyValues[i+1].Key != keyValues[left].Key {
-								if h := (ihash(keyValues[left].Key) % nReduce) + nMap; h != task.Id {
-									left = i + 1
-									right = i + 1
-									continue
-								}
-								right = i
-								values := make([]string, 0, right-left+1)
-								for j := left; j <= right; j++ {
-									values = append(values, keyValues[j].Value)
-								}
-								mmapMutex.Lock()
-								if vs, ok := mmap[keyValues[left].Key]; !ok {
-									mmap[keyValues[left].Key] = values
-								} else {
-									vs = append(vs, values...)
-									mmap[keyValues[left].Key] = append(mmap[keyValues[left].Key], values...)
-								}
-								mmapMutex.Unlock()
-								left = i + 1
-								right = i + 1
-							}
-						}
-					}(intermediateFile)
-				}
-				for handleIntermediateNumber.Load() != int64(finalSum) {
-					time.Sleep(time.Second)
-				}
-				// 将output内容写入output文件文件中
-				results := make([]KeyValue, 0)
-				for k, vs := range mmap {
-					results = append(results, KeyValue{k, reducef(k, vs)})
-				}
-				sort.Sort(ByKey(results))
-				for _, r := range results {
-					if _, err = fmt.Fprintf(tampOfile, "%v %v\n", r.Key, r.Value); err != nil {
-						log.Println("fmt fprintf tamp output file failed:", err)
-						return
-					}
-				}
-				// 将文件重命名
-				if err = os.Rename(task.OutputFile+".tamp", task.OutputFile); err != nil {
-					log.Println("rename tamp output file failed:", err)
-					return
+					mmapMutex.Unlock()
+					left = i + 1
+					right = i + 1
 				}
 			}
-		}(task)
+		}, func(panic interface{}) {
+			defer func() {
+				<-maxHandleIntermediateCount
+			}()
+			defer hasHandleIntermediateNumber.Add(1)
+		})
 	}
+	for hasHandleIntermediateNumber.Load() != finalIntermediateCount.Load() {
+		time.Sleep(time.Second)
+	}
+	// 将output内容写入output文件文件中
+	results := make([]KeyValue, 0)
+	for k, vs := range mmap {
+		results = append(results, KeyValue{k, reducef(k, vs)})
+	}
+	sort.Sort(ByKey(results))
+	for _, r := range results {
+		if _, err = fmt.Fprintf(tmpOfile, "%v %v\n", r.Key, r.Value); err != nil {
+			return err
+		}
+	}
+	// 将文件重命名
+	if err = os.Rename(task.OutputFile+".tmp", task.OutputFile); err != nil {
+		return err
+	}
+	return err
+}
+
+func getTaskCount() (int, int, error) {
+	args := GetNTaskArgs{
+		WorkerId: workerId,
+	}
+	reply := GetNTaskReply{}
+	if err := client.Call("Coordinator.GetNTask", &args, &reply); err != nil {
+		return 0, 0, err
+	}
+	nReduce := reply.NReduce
+	nMap := reply.NMap
+	return nMap, nReduce, nil
+}
+
+func getIntermediateFiles(task Task, receiveIntermediateCount int64) ([]string, int64, error) {
+	args := GetIntermediateFilesArgs{
+		WorkerId:     workerId,
+		ReduceTaskId: task.Id,
+		ReceiveCount: receiveIntermediateCount,
+	}
+	reply := GetIntermediateFilesReply{}
+	if err := client.Call("Coordinator.GetIntermediateFiles", &args, &reply); err != nil {
+		return nil, 0, err
+	}
+	return reply.IntermediateFiles, reply.FinalCount, nil
+}
+
+func askTask() (Task, error) {
+	args := AskTaskArgs{WorkerId: workerId}
+	reply := AskTaskReply{}
+	if err := client.Call("Coordinator.AskTask", &args, &reply); err != nil {
+		return Task{}, err
+	}
+	return reply.Task, nil
 }
 
 func reportCompleted(client *rpc.Client, workerId string, taskType string, taskId int) {
@@ -290,7 +378,7 @@ func reportIdle(client *rpc.Client, workerId string, taskType string, taskId int
 	}
 }
 
-func reportError(client *rpc.Client, workerId string, taskType string, taskId int, err error) {
+func reportError(client *rpc.Client, workerId string, taskType string, taskId int, err interface{}) {
 	args := ReportTaskStateArgs{
 		WorkerId: workerId,
 		Type:     taskType,

@@ -48,7 +48,7 @@ type ReportTaskStateArgs struct {
 	// 任务状态
 	State string
 	// 错误
-	Err error
+	Err interface{}
 }
 type ReportTaskStateReply struct {
 	Common
@@ -60,12 +60,12 @@ type GetIntermediateFilesArgs struct {
 	// reduce任务id
 	ReduceTaskId int
 	// 上一次获取到的索引处 -1
-	ReceiveCount int
+	ReceiveCount int64
 }
 type GetIntermediateFilesReply struct {
 	Common
 	IntermediateFiles []string
-	Sum               int
+	FinalCount        int64
 }
 
 type CountIntermediateFilesArgs struct {

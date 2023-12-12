@@ -15,7 +15,7 @@ https://pdos.csail.mit.edu/6.824/schedule.html
 > completed its task in a reasonable amount of time (for this lab, use ten seconds), and give the same 
 > task to a different worker.
 
-任务：
+实现：
 
 1. 分布式系统
 2. 协调者（一个进程）、工作者（一个或一个以上）
@@ -23,6 +23,7 @@ https://pdos.csail.mit.edu/6.824/schedule.html
 4. 协调者与工作者通过RPC通信
 5. 工作者向协调者询问任务，从一个或多个文件读取输入，执行任务，输出结构到一个或多个文件
 6. 如果工作者超时或者没有规定时间完成任务，协调者将任务给其他的工作者（任务副本）
+7. 处理任务panic
 
 运行协调者
 
@@ -46,7 +47,7 @@ cat mr-out-* | sort | more
 
 工作者是客户端
 
-
+死锁问题和并发问题
 
 
 

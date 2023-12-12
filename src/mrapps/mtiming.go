@@ -28,7 +28,6 @@ func nparallel(phase string) int {
 	if err != nil {
 		panic(err)
 	}
-	//log.Println(myfilename, "创建一次")
 
 	// are any other workers running?
 	// find their PIDs by scanning directory for mr-worker-XXX files.
@@ -58,10 +57,9 @@ func nparallel(phase string) int {
 	time.Sleep(1 * time.Second)
 
 	err = os.Remove(myfilename)
-	//if err != nil {
-	//	panic(err)
-	//}
-	//log.Println(myfilename, "删除一次")
+	if err != nil {
+		panic(err)
+	}
 
 	return ret
 }

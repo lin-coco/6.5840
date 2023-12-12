@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"sync"
 	"time"
@@ -37,7 +38,7 @@ type (
 		Splits []string
 		// 未派发任务
 		UnDistributedTasks map[int]Task
-		// 任务
+		// 已派发任务
 		Tasks map[int]Task
 		// map任务 中间文件写入完成顺序
 		CompletedIntermediateFiles []string
@@ -68,15 +69,14 @@ type (
 
 var (
 	taskMutex              = sync.Mutex{}
+	completeTaskMutex      = sync.Mutex{}
+	errorTaskMutex         = sync.Mutex{}
 	intermediateFilesMutex = sync.Mutex{}
 	outputFilesMutex       = sync.Mutex{}
-	errorTaskMutex         = sync.Mutex{}
-	completeTaskMutex      = sync.Mutex{}
 	IntermediateDir        = "intermediate"     // 中间目录
 	IntermediatePrefix     = "mr-intermediate-" // 中间目录
 	OutputDir              = ""                 // 输出目录        // 输出目录
 	OutputPrefix           = "mr-out-"          // 输出目录        // 输出目录
-	HealthCheckTimeout     = 10
 )
 
 /*
@@ -84,46 +84,60 @@ AskTask 工作者向协调者询问任务
 要保证并发安全
 */
 func (c *Coordinator) AskTask(args *AskTaskArgs, reply *AskTaskReply) error {
-	taskMutex.Lock()
-	defer taskMutex.Unlock()
-	if len(c.UnDistributedTasks) == 0 {
+	err := func() error {
+		taskMutex.Lock()
+		defer taskMutex.Unlock()
+		if len(c.UnDistributedTasks) == 0 {
+			return nil
+		}
+		var (
+			id   int
+			task Task
+		)
+		for id, task = range c.UnDistributedTasks {
+			log.Printf("distribute task:%d to worker:%s", task.Id, args.WorkerId)
+			break
+		}
+		task.WorkerId = args.WorkerId
+		delete(c.UnDistributedTasks, id)
+		c.Tasks[id] = task
+		reply.Task = task
 		return nil
+	}()
+	if err != nil {
+		return err
 	}
-	defer c.calTaskState(reply.Task)
-	var (
-		id   int
-		task Task
-	)
-	for id, task = range c.UnDistributedTasks {
-		break
-	}
-	task.WorkerId = args.WorkerId
-	delete(c.UnDistributedTasks, id)
-	c.Tasks[id] = task
-	reply.Task = task
+	c.pingTaskState(reply.Task)
 	return nil
 }
 
-func (c *Coordinator) calTaskState(task Task) {
+func (c *Coordinator) pingTaskState(task Task) {
 	if task.Type == "" {
 		return
 	}
-	go func(lastTask Task) {
+	go func(task Task) {
+		lastTask := task
 		for {
 			time.Sleep(10 * time.Second)
-			newTask := c.Tasks[lastTask.Id]
-			if newTask.State == COMPLETED || newTask.State == ERROR || newTask.WorkerId != lastTask.WorkerId {
-				break
-			}
-			if newTask.State == lastTask.State {
-				log.Printf("a worker:%s hasn't completed its task in a reasonable amount of time\n", task.WorkerId)
-				// 放到未分配任务中
+			if b := func() bool {
 				taskMutex.Lock()
-				newTask.WorkerId = ""
-				newTask.State = ""
-				c.UnDistributedTasks[newTask.Id] = newTask
-				delete(c.Tasks, newTask.Id)
-				taskMutex.Unlock()
+				defer taskMutex.Unlock()
+				newTask := c.Tasks[lastTask.Id]
+				if newTask.WorkerId != lastTask.WorkerId {
+					return true
+				}
+				if newTask.State == lastTask.State {
+					log.Printf("a worker:%s hasn't completed its task:%d in a reasonable amount of time\n", task.WorkerId, task.Id)
+					// 放到未分配任务中
+					newTask.WorkerId = ""
+					newTask.State = ""
+					c.UnDistributedTasks[newTask.Id] = newTask
+					delete(c.Tasks, newTask.Id)
+					return true
+				}
+				lastTask = newTask
+				return false
+			}(); b {
 				break
 			}
 		}
@@ -134,49 +148,50 @@ func (c *Coordinator) calTaskState(task Task) {
 ReportTaskState 工作者向协调者报告状态
 */
 func (c *Coordinator) ReportTaskState(args *ReportTaskStateArgs, reply *ReportTaskStateReply) error {
-	taskMutex.Lock()
-	defer taskMutex.Unlock()
-	if t, ok := c.Tasks[args.Id]; !ok {
-		return fmt.Errorf("task:%d may be wait a different worker", t.Id)
-	} else if args.WorkerId != t.WorkerId {
-		return fmt.Errorf("task:%d may be give a different worker:%s", t.Id, t.WorkerId)
-	} else {
-		t.State = args.State
-		delete(c.Tasks, args.Id)
-		c.Tasks[args.Id] = t
-		switch t.State {
-		case ERROR:
-			log.Printf("task:%d has error:%v\n", t.Id, args.Err)
-			errorTaskMutex.Lock()
-			c.ErrorTask = append(c.ErrorTask, t)
-			errorTaskMutex.Unlock()
-		case IDLE:
-		case PROGRESS:
-		case COMPLETED:
-			if t.Type == MAP {
-				intermediateFilesMutex.Lock()
-				c.CompletedIntermediateFiles = append(c.CompletedIntermediateFiles, t.IntermediateFile)
-				intermediateFilesMutex.Unlock()
+	if err := func() error {
+		taskMutex.Lock()
+		defer taskMutex.Unlock()
+		if t, ok := c.Tasks[args.Id]; !ok {
+			return fmt.Errorf("task:%d may be wait a different worker", t.Id)
+		} else if args.WorkerId != t.WorkerId {
+			return fmt.Errorf("task:%d may be give a different worker:%s", t.Id, t.WorkerId)
+		} else {
+			t.State = args.State
+			delete(c.Tasks, args.Id)
+			c.Tasks[args.Id] = t
+			switch t.State {
+			case ERROR:
+				log.Printf("task:%d has error:%v\n", t.Id, args.Err)
+				errorTaskMutex.Lock()
+				c.ErrorTask = append(c.ErrorTask, t)
+				errorTaskMutex.Unlock()
+			case IDLE:
+				log.Printf("task:%d has idle\n", t.Id)
+			case PROGRESS:
+				log.Printf("task:%d has progress\n", t.Id)
+			case COMPLETED:
+				log.Printf("task:%d has completed\n", t.Id)
+				if t.Type == MAP {
+					intermediateFilesMutex.Lock()
+					c.CompletedIntermediateFiles = append(c.CompletedIntermediateFiles, t.IntermediateFile)
+					intermediateFilesMutex.Unlock()
+				}
+				if t.Type == REDUCE {
+					outputFilesMutex.Lock()
+					c.CompletedOutputFiles = append(c.CompletedOutputFiles, t.OutputFile)
+					outputFilesMutex.Unlock()
+				}
+				completeTaskMutex.Lock()
+				c.CompleteTask = append(c.CompleteTask, t)
+				completeTaskMutex.Unlock()
 			}
-			if t.Type == REDUCE {
-				outputFilesMutex.Lock()
-				c.CompletedOutputFiles = append(c.CompletedOutputFiles, t.OutputFile)
-				outputFilesMutex.Unlock()
-			}
-			completeTaskMutex.Lock()
-			c.CompleteTask = append(c.CompleteTask, t)
-			completeTaskMutex.Unlock()
 		}
+		return nil
+	}(); err != nil {
+		return err
 	}
 	// 如果全部完成，则结束
-	if len(c.ErrorTask)+len(c.CompleteTask) == len(c.Splits)+c.NReduce {
-		//_ = os.RemoveAll(IntermediateDir)
-		log.Printf("all task has ended\n\n")
-		log.Println("CompleteTask", c.CompleteTask)
-		log.Println("ErrorTask", c.ErrorTask)
-		log.Println("CompletedOutputFiles", c.CompletedOutputFiles)
-		c.done = true
-	}
+	go c.printTaskState()
 	reply.Status = http.StatusOK
 	return nil
 }
@@ -185,22 +200,22 @@ func (c *Coordinator) ReportTaskState(args *ReportTaskStateArgs, reply *ReportTa
 GetIntermediateFiles reduce工作者定期获取已完成的中间文件
 */
 func (c *Coordinator) GetIntermediateFiles(args *GetIntermediateFilesArgs, reply *GetIntermediateFilesReply) error {
-	intermediateFilesMutex.Lock()
-	defer intermediateFilesMutex.Unlock()
 	errorTaskMutex.Lock()
 	defer errorTaskMutex.Unlock()
+	intermediateFilesMutex.Lock()
+	defer intermediateFilesMutex.Unlock()
 	reply.IntermediateFiles = c.CompletedIntermediateFiles[args.ReceiveCount:len(c.CompletedIntermediateFiles)]
-	reply.Sum = len(c.Splits)
+	reply.FinalCount = int64(len(c.Splits))
 	for _, t := range c.ErrorTask {
 		if t.Type == MAP {
-			reply.Sum--
+			reply.FinalCount--
 		}
 	}
 	return nil
 }
 
 /*
-GetNReduce reduce工作者获取NReduce
+GetNTask reduce工作者获取NReduce
 */
 func (c *Coordinator) GetNTask(args *GetNTaskArgs, reply *GetNTaskReply) error {
 	reply.NReduce = c.NReduce
@@ -208,7 +223,6 @@ func (c *Coordinator) GetNTask(args *GetNTaskArgs, reply *GetNTaskReply) error {
 	return nil
 }
 
-// start a thread that listens for RPCs from worker.go
 func (c *Coordinator) server() {
 	err := rpc.Register(c)
 	if err != nil {
@@ -223,15 +237,10 @@ func (c *Coordinator) server() {
 	log.Println("server running in:", ":1234")
 }
 
-// main/mrcoordinator.go calls Done() periodically to find out
-// if the entire job has finished.
 func (c *Coordinator) Done() bool {
 	return c.done
 }
 
-// create a Coordinator.
-// main/mrcoordinator.go calls this function.
-// nReduce is the number of reduce tasks to use.
 func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	c := Coordinator{
 		InputFiles: files,
@@ -268,13 +277,40 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	if err := os.MkdirAll(IntermediateDir, os.ModePerm); err != nil {
 		log.Fatal("mkdir all IntermediateDir error:", err)
 	}
-	//if err := os.RemoveAll(filepath.Join(OutputDir, OutputPrefix+"*")); err != nil {
-	//	log.Fatal("remove all OutputDir error:", err)
-	//}
-	//if err := os.MkdirAll(OutputDir, os.ModePerm); err != nil {
-	//	log.Fatal("mkdir all OutputDir error:", err)
-	//}
 	_ = exec.Command("sh", "-c", "rm -f mr-out-*").Run()
 	c.server()
+	go func() {
+		for {
+			time.Sleep(5 * time.Second)
+			c.printTaskState()
+		}
+	}()
+	go func() {
+		// 访问当前的 goroutine 信息
+		for {
+			time.Sleep(5 * time.Second)
+			var m runtime.MemStats
+			runtime.ReadMemStats(&m)
+			fmt.Printf("Num Goroutine: %d\n", runtime.NumGoroutine())
+			fmt.Printf("Num Block: %d\n", m.NumGC)
+		}
+	}()
 	return &c
+}
+
+func (c *Coordinator) printTaskState() {
+	taskMutex.Lock()
+	defer taskMutex.Unlock()
+	completeTaskMutex.Lock()
+	defer completeTaskMutex.Unlock()
+	errorTaskMutex.Lock()
+	defer errorTaskMutex.Unlock()
+	log.Printf("UnDistributedTasks num:%d, Task num:%d, CompleteTask num:%d, ErrorTask num:%d\n", len(c.UnDistributedTasks), len(c.Tasks), len(c.CompleteTask), len(c.ErrorTask))
+	if len(c.ErrorTask)+len(c.CompleteTask) >= len(c.Splits)+c.NReduce {
+		log.Printf("all task has ended\n\n")
+		log.Println("CompleteTask", c.CompleteTask)
+		log.Println("ErrorTask", c.ErrorTask)
+		log.Println("CompletedOutputFiles", c.CompletedOutputFiles)
+		c.done = true
+	}
 }
